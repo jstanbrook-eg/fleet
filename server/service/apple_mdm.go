@@ -57,6 +57,7 @@ import (
 	"github.com/fleetdm/fleet/v4/server/service/middleware/endpoint_utils"
 	"github.com/fleetdm/fleet/v4/server/variables"
 	"github.com/fleetdm/fleet/v4/server/worker"
+	"github.com/go-kit/log"
 	kitlog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
@@ -3844,12 +3845,229 @@ func (svc *MDMAppleCheckinAndCommandService) handleRefetchAppsResults(ctx contex
 	if err != nil {
 		return nil, ctxerr.Wrap(ctx, err, "unmarshal app list")
 	}
-	_, err = svc.ds.UpdateHostSoftware(ctx, host.ID, software)
-	if err != nil {
+
+	if _, err := svc.ds.UpdateHostSoftware(ctx, host.ID, software); err != nil {
 		return nil, ctxerr.Wrap(ctx, err, "update host software")
 	}
 
+	if err := svc.handleScheduledUpdates(ctx, host, software); err != nil {
+		return nil, ctxerr.Wrap(ctx, err, "handle scheduled updates")
+	}
+
 	return nil, nil
+}
+
+func (svc *MDMAppleCheckinAndCommandService) handleScheduledUpdates(
+	ctx context.Context,
+	host *fleet.Host,
+	softwares []fleet.Software,
+) error {
+	if host.TimeZone == nil {
+		// We cannot determine if it's safe to schedule an update on this host.
+		return nil
+	}
+
+	var teamID uint
+	if host.TeamID != nil {
+		teamID = *host.TeamID
+	}
+	softwaresWithAutoUpdateSchedule, err := svc.ds.ListSoftwareAutoUpdateSchedules(ctx,
+		teamID,
+		fleet.SoftwareAutoUpdateScheduleFilter{
+			Enabled: ptr.Bool(true),
+		},
+	)
+	if err != nil {
+		return ctxerr.Wrap(ctx, err, "list software auto update schedules")
+	}
+
+	// Code below assumes svc.ds.ListSoftwareAutoUpdateSchedules with Enabled=true returns:
+	// 	- all entries with non-nil AutoUpdateStartTime and AutoUpdateEndTime
+	// 	- returned title IDs are VPP applications (currently the only entities that can have update window configured).
+
+	if len(softwaresWithAutoUpdateSchedule) == 0 {
+		// Nothing else to do.
+		return nil
+	}
+
+	// Create map of installed software title versions by name, bundle identifier and source.
+	installedVersionByNameBundleIdentifierAndSource := make(map[string]string, len(softwares))
+	for _, software := range softwares {
+		installedVersionByNameBundleIdentifierAndSource[software.Name+software.BundleIdentifier+software.Source] = software.Version
+	}
+
+	// 1. Filter out software that is not within the configured update window in the host timezone.
+	var softwaresWithinUpdateSchedule []fleet.SoftwareAutoUpdateSchedule
+	for _, softwareWithAutoUpdateSchedule := range softwaresWithAutoUpdateSchedule {
+		ok, err := isTimezoneInWindow(ctx,
+			*host.TimeZone,
+			*softwareWithAutoUpdateSchedule.AutoUpdateStartTime,
+			*softwareWithAutoUpdateSchedule.AutoUpdateEndTime,
+		)
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "is timezone in window")
+		}
+		if !ok {
+			// Host's local time is not within update window.
+			continue
+		}
+		softwaresWithinUpdateSchedule = append(softwaresWithinUpdateSchedule, softwareWithAutoUpdateSchedule)
+	}
+	if len(softwaresWithinUpdateSchedule) == 0 {
+		// Nothing else to do.
+		return nil
+	}
+
+	// 2. Filter out software that is already at the latest version or higher.
+	var (
+		softwaresWithinUpdateWindowThatNeedUpdate []fleet.SoftwareAutoUpdateSchedule
+		softwareTitles                            = make(map[uint]*fleet.SoftwareTitle)
+	)
+	for _, softwareWithAutoUpdateSchedule := range softwaresWithinUpdateSchedule {
+		softwareTitle, err := svc.ds.SoftwareTitleByID(ctx, softwareWithAutoUpdateSchedule.TitleID, host.TeamID, fleet.TeamFilter{})
+		if err != nil {
+			return ctxerr.Wrap(ctx, err, "software title by id")
+		}
+		logger := log.With(svc.logger,
+			"name", softwareTitle.Name,
+			"bundle_identifier", softwareTitle.BundleIdentifier,
+			"source", softwareTitle.Source,
+		)
+		if softwareTitle.AppStoreApp == nil {
+			level.Error(logger).Log("msg", "title should be VPP app", "software_title_id", softwareTitle.ID)
+			continue
+		}
+		// Incoming softwares have Name, BundleIdentifier, Source and Version.
+		var bundleIdentifier string
+		if softwareTitle.BundleIdentifier != nil {
+			bundleIdentifier = *softwareTitle.BundleIdentifier
+		}
+		installedVersion, ok := installedVersionByNameBundleIdentifierAndSource[softwareTitle.Name+bundleIdentifier+softwareTitle.Source]
+		if !ok {
+			level.Info(logger).Log(
+				"msg", "software not installed on device, skipping from update",
+			)
+			continue
+		}
+		if _, err := fleet.VersionToSemverVersion(installedVersion); err != nil {
+			level.Error(logger).Log(
+				"msg", "invalid installed version",
+				"version", installedVersion,
+			)
+			continue
+		}
+		if _, err := fleet.VersionToSemverVersion(softwareTitle.AppStoreApp.LatestVersion); err != nil {
+			level.Error(logger).Log(
+				"msg", "invalid latest version",
+				"version", softwareTitle.AppStoreApp.LatestVersion,
+			)
+			continue
+		}
+		if fleet.CompareVersions(softwareTitle.AppStoreApp.LatestVersion, installedVersion) != 1 {
+			// Installed version is equal or higher than latest version, so nothing to do here.
+			continue
+		}
+		softwaresWithinUpdateWindowThatNeedUpdate = append(softwaresWithinUpdateWindowThatNeedUpdate, softwareWithAutoUpdateSchedule)
+		softwareTitles[softwareTitle.ID] = softwareTitle
+	}
+	if len(softwaresWithinUpdateWindowThatNeedUpdate) == 0 {
+		// Nothing else to do.
+		return nil
+	}
+
+	// 3. Filter out software that already has a pending installation (update).
+	adamIDsPendingInstallForHost, err := svc.ds.MapAdamIDsPendingInstall(ctx, host.ID)
+	var softwaresWithinUpdateScheduleToInstall []*fleet.SoftwareTitle
+	for _, softwareWithinUpdateSchedule := range softwaresWithinUpdateWindowThatNeedUpdate {
+		softwareTitle, ok := softwareTitles[softwareWithinUpdateSchedule.TitleID]
+		if !ok {
+			// "Should not happen", so we log it just in case.
+			level.Error(svc.logger).Log("msg", "missing title ID from map", "software_title_id", softwareTitle.ID)
+			continue
+		}
+		if softwareTitle.AppStoreApp == nil {
+			level.Error(svc.logger).Log("msg", "title should be VPP app", "software_title_id", softwareTitle.ID)
+			continue
+		}
+		if _, ok := adamIDsPendingInstallForHost[softwareTitle.AppStoreApp.AdamID]; ok {
+			// Skip this software title because there's already a pending install for this title.
+			continue
+		}
+		softwaresWithinUpdateScheduleToInstall = append(softwaresWithinUpdateScheduleToInstall, softwareTitle)
+	}
+	if len(softwaresWithinUpdateScheduleToInstall) == 0 {
+		// Nothing else to do.
+		return nil
+	}
+
+	// 3. Issue installation of the software titles to update.
+	for _, softwareTitle := range softwaresWithinUpdateScheduleToInstall {
+		var bundleIdentifier string
+		if softwareTitle.BundleIdentifier != nil {
+			bundleIdentifier = *softwareTitle.BundleIdentifier
+		}
+		level.Debug(svc.logger).Log(
+			"msg", "issuing update for software",
+			"software_title_id", softwareTitle.ID,
+			"adam_id", softwareTitle.AppStoreApp.AdamID,
+			"latest_version", softwareTitle.AppStoreApp.LatestVersion,
+			"installed_version", installedVersionByNameBundleIdentifierAndSource[softwareTitle.Name+bundleIdentifier+softwareTitle.Source],
+		)
+	}
+
+	return nil
+}
+
+// getCurrentLocalTimeInHostTimeZone returns the current time of the given IANA time zone string.
+func getCurrentLocalTimeInHostTimeZone(ctx context.Context, timeZone string) (time.Time, error) {
+	loc, err := time.LoadLocation(timeZone)
+	if err != nil {
+		return time.Time{}, ctxerr.Wrap(ctx, err, "load location")
+	}
+
+	// Convert now to the specified location using the In() method
+	localTime := time.Now().In(loc)
+	return localTime, nil
+}
+
+// isTimezoneInWindow checks if the given timezone is currently within
+// the time window defined by start and end.
+// Arguments start and end should be in "HH:MM" format (24-hour clock).
+// Returns true if the timezone current time is within [start, end], inclusive.
+// Handles windows that cross midnight (e.g., "22:00" to "06:00").
+func isTimezoneInWindow(ctx context.Context, timezone string, start string, end string) (bool, error) {
+	t, err := getCurrentLocalTimeInHostTimeZone(ctx, timezone)
+	if err != nil {
+		return false, ctxerr.Wrap(ctx, err, "get current local time in host timezone")
+	}
+
+	// Parse start and end times (using a dummy date since we only care about time of day)
+	dummyDate := "2000-01-01"
+	startTime, err := time.Parse("2006-01-02 15:04", dummyDate+" "+start)
+	if err != nil {
+		return false, fmt.Errorf("invalid start time format: %w", err)
+	}
+	endTime, err := time.Parse("2006-01-02 15:04", dummyDate+" "+end)
+	if err != nil {
+		return false, fmt.Errorf("invalid end time format: %w", err)
+	}
+
+	// Extract time of day (same date as dummy)
+	current := time.Date(2000, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), t.Location())
+
+	// If end is before start, it means the window crosses midnight
+	if endTime.Before(startTime) {
+		// Case: crosses midnight, e.g., 22:00 to 06:00
+		// True if current >= start OR current <= end
+		return current.Equal(startTime) ||
+			current.After(startTime) ||
+			current.Before(endTime) ||
+			current.Equal(endTime), nil
+	}
+
+	// Normal case: same day window, e.g., 09:00 to 17:00
+	return (current.Equal(startTime) || current.After(startTime)) &&
+		(current.Equal(endTime) || current.Before(endTime)), nil
 }
 
 func (svc *MDMAppleCheckinAndCommandService) handleRefetchCertsResults(ctx context.Context, host *fleet.Host, cmdResult *mdm.CommandResults) (*mdm.Command, error) {
@@ -3948,6 +4166,9 @@ func (svc *MDMAppleCheckinAndCommandService) handleRefetchDeviceResults(ctx cont
 	// on refetch similar to other platforms to simplify exclusion logic with dynamic labels
 	host.LabelUpdatedAt = time.Now()
 	host.RefetchRequested = false
+
+	timeZone := deviceInformationResponse.QueryResponses["TimeZone"].(string)
+	host.TimeZone = &timeZone
 
 	if err := svc.ds.UpdateHost(ctx, host); err != nil {
 		return nil, ctxerr.Wrap(ctx, err, "failed to update host")
